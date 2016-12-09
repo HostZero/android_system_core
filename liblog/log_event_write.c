@@ -15,10 +15,8 @@
  */
 
 #include <errno.h>
-#include <stdint.h>
 
 #include <log/log.h>
-#include <log/log_event_list.h>
 
 #include "log_portability.h"
 

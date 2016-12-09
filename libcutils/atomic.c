@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2016 The Android Open Source Project
+ * Copyright (C) 2007 The Android Open Source Project
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -14,20 +14,13 @@
  * limitations under the License.
  */
 
-#ifndef __CUTILS_ANDROID_GET_CONTROL_ENV_H
-#define __CUTILS_ANDROID_GET_CONTROL_ENV_H
+/*
+ * Generate non-inlined versions of android_atomic functions.
+ * Nobody should be using these, but some binary blobs currently (late 2014)
+ * are.
+ * If you read this in 2015 or later, please try to delete this file.
+ */
 
-/* To declare library function hidden and internal */
-#define LIBCUTILS_HIDDEN __attribute__((visibility("hidden")))
+#define ANDROID_ATOMIC_INLINE
 
-#ifdef __cplusplus
-extern "C" {
-#endif
-
-LIBCUTILS_HIDDEN int __android_get_control_from_env(const char* prefix,
-                                                    const char* name);
-#ifdef __cplusplus
-}
-#endif
-
-#endif /* __CUTILS_ANDROID_GET_CONTROL_ENV_H */
+#include <cutils/atomic.h>

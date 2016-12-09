@@ -24,9 +24,9 @@
 #include <sys/types.h>
 #include <unistd.h>
 
-#include <cutils/android_get_control_file.h>
 #include <cutils/klog.h>
 
+static int klog_fd = -1;
 static int klog_level = KLOG_DEFAULT_LEVEL;
 
 int klog_get_level(void) {
@@ -37,27 +37,32 @@ void klog_set_level(int level) {
     klog_level = level;
 }
 
-static int __open_klog(void) {
-    static const char kmsg_device[] = "/dev/kmsg";
+void klog_init(void) {
+    if (klog_fd >= 0) return; /* Already initialized */
 
-    int ret = android_get_control_file(kmsg_device);
-    if (ret >= 0) return ret;
-    return TEMP_FAILURE_RETRY(open(kmsg_device, O_WRONLY | O_CLOEXEC));
+    klog_fd = open("/dev/kmsg", O_WRONLY | O_CLOEXEC);
+    if (klog_fd >= 0) {
+        return;
+    }
+
+    static const char* name = "/dev/__kmsg__";
+    if (mknod(name, S_IFCHR | 0600, (1 << 8) | 11) == 0) {
+        klog_fd = open(name, O_WRONLY | O_CLOEXEC);
+        unlink(name);
+    }
 }
 
 #define LOG_BUF_MAX 512
 
 void klog_writev(int level, const struct iovec* iov, int iov_count) {
     if (level > klog_level) return;
-
-    static int klog_fd = __open_klog();
-    if (klog_fd == -1) return;
+    if (klog_fd < 0) klog_init();
+    if (klog_fd < 0) return;
     TEMP_FAILURE_RETRY(writev(klog_fd, iov, iov_count));
 }
 
 void klog_write(int level, const char* fmt, ...) {
     if (level > klog_level) return;
-
     char buf[LOG_BUF_MAX];
     va_list ap;
     va_start(ap, fmt);

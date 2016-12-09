@@ -24,10 +24,11 @@ liblog_sources = [
 ]
 liblog_host_sources = [
     "fake_log_device.c",
+    //"event.logtags",
     "fake_writer.c",
 ]
 liblog_target_sources = [
-    "event_tag_map.cpp",
+    "event_tag_map.c",
     "config_read.c",
     "log_time.cpp",
     "log_is_loggable.c",
@@ -55,9 +56,7 @@ cc_library {
         android: {
             srcs: liblog_target_sources,
             // AddressSanitizer runtime library depends on liblog.
-            sanitize: {
-                never: true,
-            },
+            sanitize: ["never"],
         },
         android_arm: {
             // TODO: This is to work around b/24465209. Remove after root cause is fixed
@@ -68,13 +67,10 @@ cc_library {
             enabled: true,
         },
         not_windows: {
-            srcs: ["event_tag_map.cpp"],
+            srcs: ["event_tag_map.c"],
         },
         linux: {
             host_ldlibs: ["-lrt"],
-        },
-        linux_bionic: {
-            enabled: true,
         },
     },
 
@@ -87,31 +83,9 @@ cc_library {
         //       's/^\([0-9]*\)[ \t]*liblog[ \t].*/-DLIBLOG_LOG_TAG=\1/p' \
         //       $(LOCAL_PATH)/event.logtags)
         // so make sure we do not regret hard-coding it as follows:
-        "-DLIBLOG_LOG_TAG=1006",
+        "-DLIBLOG_LOG_TAG=1005",
         "-DSNET_EVENT_LOG_TAG=1397638484",
     ],
-    logtags: ["event.logtags"],
     compile_multilib: "both",
-}
-
-// system/core/android/log.h needs some work before it can be included in the
-// NDK. It defines a *lot* of macros that previously were usable names in NDK
-// sources that used android/log.h. As an example, the following file defines
-// LOG_TAG as a variable, but the variable name gets macro replaced if we use
-// the current android/log.h.
-// https://android.googlesource.com/platform/external/deqp/+/4adc1515f867b26c19c2f7498e9de93a230a234d/framework/platform/android/tcuTestLogParserJNI.cpp#41
-//
-// For now, we keep a copy of the old NDK android/log.h in legacy-ndk-includes.
-ndk_headers {
-    name: "liblog_headers",
-    from: "legacy-ndk-includes",
-    to: "android",
-    srcs: ["legacy-ndk-includes/log.h"],
-    license: "NOTICE",
-}
-
-ndk_library {
-    name: "liblog.ndk",
-    symbol_file: "liblog.map.txt",
-    first_version: "9",
+    stl: "none",
 }

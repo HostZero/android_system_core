@@ -19,7 +19,7 @@
 #include <stdio.h>
 #include <string.h>
 
-#include <private/android_logger.h>
+#include <log/log_read.h>
 
 #include "log_portability.h"
 

@@ -23,8 +23,8 @@
 #include <string.h>
 #include <unistd.h>
 
-#include <log/log.h>
 #include <cutils/sched_policy.h>
+#include <log/log.h>
 
 #define UNUSED __attribute__((__unused__))
 
@@ -45,6 +45,9 @@ static inline SchedPolicy _policy(SchedPolicy p)
 
 #define POLICY_DEBUG 0
 
+// This prctl is only available in Android kernels.
+#define PR_SET_TIMERSLACK_PID 41
+
 // timer slack value in nS enforced when the thread moves to background
 #define TIMER_SLACK_BG 40000000
 #define TIMER_SLACK_FG 50000
@@ -52,7 +55,6 @@ static inline SchedPolicy _policy(SchedPolicy p)
 static pthread_once_t the_once = PTHREAD_ONCE_INIT;
 
 static int __sys_supports_schedgroups = -1;
-static int __sys_supports_timerslack = -1;
 
 // File descriptors open to /dev/cpuctl/../tasks, setup by initialize, or -1 on error.
 static int bg_cgroup_fd = -1;
@@ -108,7 +110,7 @@ static int add_tid_to_cgroup(int tid, int fd)
 
 static void __initialize(void) {
     char* filename;
-    if (!access("/dev/cpuctl/tasks", W_OK)) {
+    if (!access("/dev/cpuctl/tasks", F_OK)) {
         __sys_supports_schedgroups = 1;
 
         filename = "/dev/cpuctl/tasks";
@@ -127,7 +129,7 @@ static void __initialize(void) {
     }
 
 #ifdef USE_CPUSETS
-    if (!access("/dev/cpuset/tasks", W_OK)) {
+    if (!access("/dev/cpuset/tasks", F_OK)) {
 
         filename = "/dev/cpuset/foreground/tasks";
         fg_cpuset_fd = open(filename, O_WRONLY | O_CLOEXEC);
@@ -148,10 +150,6 @@ static void __initialize(void) {
 #endif
     }
 #endif
-
-    char buf[64];
-    snprintf(buf, sizeof(buf), "/proc/%d/timerslack_ns", getpid());
-    __sys_supports_timerslack = !access(buf, W_OK);
 }
 
 /*
@@ -173,7 +171,7 @@ static int getCGroupSubsys(int tid, const char* subsys, char* buf, size_t bufLen
     FILE *fp;
 
     snprintf(pathBuf, sizeof(pathBuf), "/proc/%d/cgroup", tid);
-    if (!(fp = fopen(pathBuf, "re"))) {
+    if (!(fp = fopen(pathBuf, "r"))) {
         return -1;
     }
 
@@ -331,22 +329,6 @@ int set_cpuset_policy(int tid, SchedPolicy policy)
 #endif
 }
 
-static void set_timerslack_ns(int tid, unsigned long long slack) {
-    // v4.6+ kernels support the /proc/<tid>/timerslack_ns interface.
-    // TODO: once we've backported this, log if the open(2) fails.
-    char buf[64];
-    snprintf(buf, sizeof(buf), "/proc/%d/timerslack_ns", tid);
-    int fd = open(buf, O_WRONLY | O_CLOEXEC);
-    if (fd != -1) {
-        int len = snprintf(buf, sizeof(buf), "%llu", slack);
-        if (write(fd, buf, len) != len) {
-            SLOGE("set_timerslack_ns write failed: %s\n", strerror(errno));
-        }
-        close(fd);
-        return;
-    }
-}
-
 int set_sched_policy(int tid, SchedPolicy policy)
 {
     if (tid == 0) {
@@ -359,11 +341,12 @@ int set_sched_policy(int tid, SchedPolicy policy)
     char statfile[64];
     char statline[1024];
     char thread_name[255];
+    int fd;
 
-    snprintf(statfile, sizeof(statfile), "/proc/%d/stat", tid);
+    sprintf(statfile, "/proc/%d/stat", tid);
     memset(thread_name, 0, sizeof(thread_name));
 
-    int fd = open(statfile, O_RDONLY | O_CLOEXEC);
+    fd = open(statfile, O_RDONLY);
     if (fd >= 0) {
         int rc = read(fd, statline, 1023);
         close(fd);
@@ -442,10 +425,8 @@ int set_sched_policy(int tid, SchedPolicy policy)
                            &param);
     }
 
-    if (__sys_supports_timerslack) {
-        set_timerslack_ns(tid, policy == SP_BACKGROUND ?
-                               TIMER_SLACK_BG : TIMER_SLACK_FG);
-    }
+    prctl(PR_SET_TIMERSLACK_PID,
+          policy == SP_BACKGROUND ? TIMER_SLACK_BG : TIMER_SLACK_FG, tid);
 
     return 0;
 }

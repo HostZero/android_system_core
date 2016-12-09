@@ -10,6 +10,10 @@ import /init.${ro.hardware}.rc
 import /init.usb.configfs.rc
 import /init.${ro.zygote}.rc
 
+# Include CM's extra init file
+import /init.cm.rc
+
+
 on early-init
     # Set init and its forked children's oom_adj.
     write /proc/1/oom_score_adj -1000
@@ -234,7 +238,7 @@ on init
     # expecting it to point to /proc/self/fd
     symlink /proc/self/fd /dev/fd
 
-    export DOWNLOAD_CACHE /data/cache
+    export DOWNLOAD_CACHE ${ro.device.cache_dir}
 
     # set RLIMIT_NICE to allow priorities from 19 to -20
     setrlimit 13 40 40
@@ -294,6 +298,7 @@ on late-init
     trigger early-boot
     trigger boot
 
+
 on post-fs
     start logd
     # once everything is setup, no need to modify /
@@ -304,8 +309,7 @@ on post-fs
     mount none /mnt/runtime/default /storage slave bind rec
 
     # Make sure /sys/kernel/debug (if present) is labeled properly
-    # Note that tracefs may be mounted under debug, so we need to cross filesystems
-    restorecon --recursive --cross-filesystems /sys/kernel/debug
+    restorecon_recursive /sys/kernel/debug
 
     # We chown/chmod /cache again so because mount is run as root + defaults
     chown system cache /cache
@@ -367,12 +371,11 @@ on post-fs-data
 
     # create basic filesystem structure
     mkdir /data/misc 01771 system misc
-    mkdir /data/misc/bluedroid 02770 bluetooth bluetooth
+    mkdir /data/misc/bluedroid 02770 bluetooth net_bt_stack
     # Fix the access permissions and group ownership for 'bt_config.conf'
     chmod 0660 /data/misc/bluedroid/bt_config.conf
-    chown bluetooth bluetooth /data/misc/bluedroid/bt_config.conf
-    mkdir /data/misc/bluetooth 0770 bluetooth bluetooth
-    mkdir /data/misc/bluetooth/logs 0770 bluetooth bluetooth
+    chown bluetooth net_bt_stack /data/misc/bluedroid/bt_config.conf
+    mkdir /data/misc/bluetooth 0770 system system
     mkdir /data/misc/keystore 0700 keystore keystore
     mkdir /data/misc/gatekeeper 0700 system system
     mkdir /data/misc/keychain 0771 system system
@@ -445,6 +448,13 @@ on post-fs-data
 
     mkdir /data/anr 0775 system system
 
+    # symlink to bugreport storage location
+    rm /data/bugreports
+    symlink /data/user_de/0/com.android.shell/files/bugreports /data/bugreports
+
+    # Separate location for storing security policy files on data
+    mkdir /data/security 0711 system system
+
     # Create all remaining /data root dirs so that they are made through init
     # and get proper encryption policy installed
     mkdir /data/backup 0700 system system
@@ -474,8 +484,14 @@ on post-fs-data
 
     init_user0
 
+    # Reload policy from /data/security if present.
+    setprop selinux.reload_policy 1
+
     # Set SELinux security contexts on upgrade or policy update.
-    restorecon --recursive --skip-ce /data
+    restorecon_recursive /data
+    restorecon /data/data
+    restorecon /data/user
+    restorecon /data/user/0
 
     # Check any timezone data in /data is newer than the copy in /system, delete if not.
     exec - system system -- /system/bin/tzdatacheck /system/usr/share/zoneinfo /data/misc/zoneinfo
@@ -555,8 +571,11 @@ on boot
     chown system system /sys/class/leds/button-backlight/brightness
     chown system system /sys/class/leds/jogball-backlight/brightness
     chown system system /sys/class/leds/red/brightness
+    chown system system /sys/class/leds/red/blink
     chown system system /sys/class/leds/green/brightness
+    chown system system /sys/class/leds/green/blink
     chown system system /sys/class/leds/blue/brightness
+    chown system system /sys/class/leds/blue/blink
     chown system system /sys/class/leds/red/device/grpfreq
     chown system system /sys/class/leds/red/device/grppwm
     chown system system /sys/class/leds/red/device/blink
@@ -573,8 +592,6 @@ on boot
     # Define default initial receive window size in segments.
     setprop net.tcp.default_init_rwnd 60
 
-    # Start all binderized HAL daemons
-    start hwservicemanager
     class_start core
 
 on nonencrypted
@@ -664,3 +681,9 @@ on property:ro.debuggable=1
 service flash_recovery /system/bin/install-recovery.sh
     class main
     oneshot
+    disabled
+
+# update recovery if enabled
+on property:persist.sys.recovery_update=true
+    start flash_recovery
+

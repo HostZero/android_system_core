@@ -20,8 +20,6 @@
 #include <string.h>
 #include <unistd.h>
 
-#define LISTEN_BACKLOG 4
-
 #if !defined(_WIN32)
 #include <sys/socket.h>
 #include <sys/select.h>
@@ -31,11 +29,14 @@
 
 #include <cutils/sockets.h>
 
-/* open listen() port on loopback interface */
-int socket_loopback_server(int port, int type)
+/* Connect to port on the loopback IP interface. type is
+ * SOCK_STREAM or SOCK_DGRAM. 
+ * return is a file descriptor or -1 on error
+ */
+int socket_loopback_client(int port, int type)
 {
     struct sockaddr_in addr;
-    int s, n;
+    int s;
 
     memset(&addr, 0, sizeof(addr));
     addr.sin_family = AF_INET;
@@ -45,25 +46,12 @@ int socket_loopback_server(int port, int type)
     s = socket(AF_INET, type, 0);
     if(s < 0) return -1;
 
-    n = 1;
-    setsockopt(s, SOL_SOCKET, SO_REUSEADDR, (const char *) &n, sizeof(n));
-
-    if(bind(s, (struct sockaddr *) &addr, sizeof(addr)) < 0) {
+    if(connect(s, (struct sockaddr *) &addr, sizeof(addr)) < 0) {
         close(s);
         return -1;
     }
 
-    if (type == SOCK_STREAM) {
-        int ret;
-
-        ret = listen(s, LISTEN_BACKLOG);
-
-        if (ret < 0) {
-            close(s);
-            return -1; 
-        }
-    }
-
     return s;
+
 }
 

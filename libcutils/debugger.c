@@ -14,20 +14,20 @@
  * limitations under the License.
  */
 
-#define LOG_TAG "DEBUG"
-
-#include <fcntl.h>
 #include <stdbool.h>
+#include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/socket.h>
 #include <sys/types.h>
+#include <sys/socket.h>
 #include <unistd.h>
 
-#include <android/log.h>
 #include <cutils/debugger.h>
 #include <cutils/sockets.h>
+
+#define LOG_TAG "DEBUG"
+#include <log/log.h>
 
 static int send_request(int sock_fd, void* msg_ptr, size_t msg_len) {
   int result = 0;
@@ -76,7 +76,9 @@ static int make_dump_request(debugger_action_t action, pid_t tid, int timeout_se
 }
 
 int dump_backtrace_to_file(pid_t tid, int fd) {
-  return dump_backtrace_to_file_timeout(tid, fd, 0);
+  // Kind of a hack;
+  // Use a timeout of 5 seconds for a given native proc
+  return dump_backtrace_to_file_timeout(tid, fd, 5);
 }
 
 int dump_backtrace_to_file_timeout(pid_t tid, int fd, int timeout_secs) {
@@ -89,13 +91,23 @@ int dump_backtrace_to_file_timeout(pid_t tid, int fd, int timeout_secs) {
   int result = 0;
   char buffer[1024];
   ssize_t n;
+  int flag = 0;
+
   while ((n = TEMP_FAILURE_RETRY(read(sock_fd, buffer, sizeof(buffer)))) > 0) {
+    flag = 1;
     if (TEMP_FAILURE_RETRY(write(fd, buffer, n)) != n) {
       result = -1;
       break;
     }
   }
   close(sock_fd);
+
+  if (flag == 0) {
+    ALOGE("Not even a single byte was read from debuggerd, for pid: %d", tid);
+  }
+  if (result == -1) {
+    ALOGE("Failure(probably timeout) while reading data from debuggerd, for pid: %d", tid);
+  }
   return result;
 }
 

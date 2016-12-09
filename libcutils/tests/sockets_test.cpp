@@ -18,12 +18,10 @@
 // IPv6 capabilities. These tests assume that no UDP packets are lost, which
 // should be the case for loopback communication, but is not guaranteed.
 
-#include <string.h>
-#include <sys/socket.h>
-#include <sys/types.h>
+#include <cutils/sockets.h>
+
 #include <time.h>
 
-#include <cutils/sockets.h>
 #include <gtest/gtest.h>
 
 // Makes sure the passed sockets are valid, sends data between them, and closes

@@ -33,7 +33,7 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 
-#include <android/log.h>
+#include <log/log.h>
 #include <private/android_filesystem_config.h>
 #include <utils/Compat.h>
 
@@ -134,48 +134,21 @@ static const struct fs_path_config android_files[] = {
     { 00750, AID_ROOT,      AID_SHELL,     0, "data/nativetest/*" },
     { 00750, AID_ROOT,      AID_SHELL,     0, "data/nativetest64/*" },
 
-    /* the following two files are INTENTIONALLY set-uid, but they
-     * are NOT included on user builds. */
-    { 04750, AID_ROOT,      AID_SHELL,     0, "system/xbin/su" },
+    /* CM's daemonized su doesn't need the setuid bit */
+    { 00755, AID_ROOT,      AID_SHELL,     0, "system/xbin/su" },
     { 06755, AID_ROOT,      AID_ROOT,      0, "system/xbin/procmem" },
 
     /* the following files have enhanced capabilities and ARE included in user builds. */
-    { 00550, AID_LOGD,      AID_LOGD,      CAP_MASK_LONG(CAP_SYSLOG) |
-                                           CAP_MASK_LONG(CAP_AUDIT_CONTROL) |
-                                           CAP_MASK_LONG(CAP_SETGID),
-                                              "system/bin/logd" },
-    { 00750, AID_ROOT,      AID_SHELL,     CAP_MASK_LONG(CAP_SETUID) |
-                                           CAP_MASK_LONG(CAP_SETGID),
-                                              "system/bin/run-as" },
-    { 00700, AID_SYSTEM,    AID_SHELL,     CAP_MASK_LONG(CAP_BLOCK_SUSPEND),
-                                              "system/bin/inputflinger" },
+    { 00750, AID_ROOT,      AID_SHELL,     CAP_MASK_LONG(CAP_SETUID) | CAP_MASK_LONG(CAP_SETGID), "system/bin/run-as" },
+    { 00700, AID_SYSTEM,    AID_SHELL,     CAP_MASK_LONG(CAP_BLOCK_SUSPEND), "system/bin/inputflinger" },
 
     /* Support FIFO scheduling mode in SurfaceFlinger. */
     { 00755, AID_SYSTEM,    AID_GRAPHICS,     CAP_MASK_LONG(CAP_SYS_NICE), "system/bin/surfaceflinger" },
 
-    /* Support hostapd administering a network interface. */
-    { 00755, AID_WIFI,      AID_WIFI,      CAP_MASK_LONG(CAP_NET_ADMIN) |
-                                           CAP_MASK_LONG(CAP_NET_RAW),
-                                              "system/bin/hostapd" },
-
-    /* Support wifi_hal_legacy administering a network interface. */
-    { 00755, AID_WIFI,      AID_WIFI,      CAP_MASK_LONG(CAP_NET_ADMIN) |
-                                           CAP_MASK_LONG(CAP_NET_RAW),
-                                              "system/bin/hw/android.hardware.wifi@1.0-service" },
-
-    /* A non-privileged zygote that spawns isolated processes for web rendering. */
-    { 0750,  AID_ROOT,      AID_ROOT,      CAP_MASK_LONG(CAP_SETUID) |
-                                           CAP_MASK_LONG(CAP_SETGID) |
-                                           CAP_MASK_LONG(CAP_SETPCAP),
-                                              "system/bin/webview_zygote32" },
-    { 0750,  AID_ROOT,      AID_ROOT,      CAP_MASK_LONG(CAP_SETUID) |
-                                           CAP_MASK_LONG(CAP_SETGID) |
-                                           CAP_MASK_LONG(CAP_SETPCAP),
-                                              "system/bin/webview_zygote64" },
-
     { 00750, AID_ROOT,      AID_ROOT,      0, "system/bin/uncrypt" },
     { 00750, AID_ROOT,      AID_ROOT,      0, "system/bin/install-recovery.sh" },
     { 00755, AID_ROOT,      AID_SHELL,     0, "system/bin/*" },
+    { 00755, AID_ROOT,      AID_SHELL,     0, "system/etc/init.d/*" },
     { 00755, AID_ROOT,      AID_ROOT,      0, "system/lib/valgrind/*" },
     { 00755, AID_ROOT,      AID_ROOT,      0, "system/lib64/valgrind/*" },
     { 00755, AID_ROOT,      AID_SHELL,     0, "system/xbin/*" },

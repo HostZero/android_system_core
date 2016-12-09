@@ -21,19 +21,18 @@
 #include <assert.h>
 #include <ctype.h>
 #include <errno.h>
-#include <inttypes.h>
-#include <pwd.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <inttypes.h>
 #include <sys/param.h>
-#include <sys/types.h>
 
 #include <cutils/list.h>
-#include <log/log.h>
+#include <log/logd.h>
 #include <log/logprint.h>
+#include <private/android_filesystem_config.h>
 
 #include "log_portability.h"
 
@@ -58,14 +57,7 @@ struct AndroidLogFormat_t {
     bool epoch_output;
     bool monotonic_output;
     bool uid_output;
-    bool descriptive_output;
 };
-
-/*
- * API issues prevent us from exposing "descriptive" in AndroidLogFormat_t
- * during android_log_processBinaryLogBuffer(), so we break layering.
- */
-static bool descriptive_output = false;
 
 /*
  *  gnome-terminal color tags
@@ -216,8 +208,6 @@ LIBLOG_ABI_PUBLIC AndroidLogFormat *android_log_format_new()
     p_ret->epoch_output = false;
     p_ret->monotonic_output = android_log_clockid() == CLOCK_MONOTONIC;
     p_ret->uid_output = false;
-    p_ret->descriptive_output = false;
-    descriptive_output = false;
 
     return p_ret;
 }
@@ -276,10 +266,6 @@ LIBLOG_ABI_PUBLIC int android_log_setPrintFormat(
     case FORMAT_MODIFIER_UID:
         p_format->uid_output = true;
         return 0;
-    case FORMAT_MODIFIER_DESCRIPT:
-        p_format->descriptive_output = true;
-        descriptive_output = true;
-        return 0;
     default:
         break;
     }
@@ -307,7 +293,6 @@ LIBLOG_ABI_PUBLIC AndroidLogPrintFormat android_log_formatFromString(
     else if (strcmp(formatString, "threadtime") == 0) format = FORMAT_THREADTIME;
     else if (strcmp(formatString, "long") == 0) format = FORMAT_LONG;
     else if (strcmp(formatString, "color") == 0) format = FORMAT_MODIFIER_COLOR;
-    else if (strcmp(formatString, "colour") == 0) format = FORMAT_MODIFIER_COLOR;
     else if (strcmp(formatString, "usec") == 0) format = FORMAT_MODIFIER_TIME_USEC;
     else if (strcmp(formatString, "printable") == 0) format = FORMAT_MODIFIER_PRINTABLE;
     else if (strcmp(formatString, "year") == 0) format = FORMAT_MODIFIER_YEAR;
@@ -315,7 +300,6 @@ LIBLOG_ABI_PUBLIC AndroidLogPrintFormat android_log_formatFromString(
     else if (strcmp(formatString, "epoch") == 0) format = FORMAT_MODIFIER_EPOCH;
     else if (strcmp(formatString, "monotonic") == 0) format = FORMAT_MODIFIER_MONOTONIC;
     else if (strcmp(formatString, "uid") == 0) format = FORMAT_MODIFIER_UID;
-    else if (strcmp(formatString, "descriptive") == 0) format = FORMAT_MODIFIER_DESCRIPT;
     else {
         extern char *tzname[2];
         static const char gmt[] = "GMT";
@@ -511,11 +495,6 @@ LIBLOG_ABI_PUBLIC int android_log_processLogBuffer(
     char *msg = buf->msg;
     struct logger_entry_v2 *buf2 = (struct logger_entry_v2 *)buf;
     if (buf2->hdr_size) {
-        if ((buf2->hdr_size < sizeof(((struct log_msg *)NULL)->entry_v1)) ||
-                (buf2->hdr_size > sizeof(((struct log_msg *)NULL)->entry))) {
-            fprintf(stderr, "+++ LOG: entry illegal hdr_size\n");
-            return -1;
-        }
         msg = ((char *)buf2) + buf2->hdr_size;
         if (buf2->hdr_size >= sizeof(struct logger_entry_v4)) {
             entry->uid = ((struct logger_entry_v4 *)buf)->uid;
@@ -554,7 +533,6 @@ LIBLOG_ABI_PUBLIC int android_log_processLogBuffer(
 
     entry->priority = msg[0];
     entry->tag = msg + 1;
-    entry->tagLen = msgStart - 1;
     entry->message = msg + msgStart;
     entry->messageLen = (msgEnd < msgStart) ? 0 : (msgEnd - msgStart);
 
@@ -581,19 +559,6 @@ static inline uint64_t get8LE(const uint8_t* src)
     return ((uint64_t) high << 32) | (uint64_t) low;
 }
 
-static bool findChar(const char** cp, size_t* len, int c) {
-    while (*len && isspace(**cp)) {
-        ++*cp;
-        --*len;
-    }
-    if (c == INT_MAX) return *len;
-    if (*len && (**cp == c)) {
-        ++*cp;
-        --*len;
-        return true;
-    }
-    return false;
-}
 
 /*
  * Recursively convert binary log data to printable form.
@@ -606,151 +571,63 @@ static bool findChar(const char** cp, size_t* len, int c) {
  *
  * Returns 0 on success, 1 on buffer full, -1 on failure.
  */
-enum objectType {
-    TYPE_OBJECTS      = '1',
-    TYPE_BYTES        = '2',
-    TYPE_MILLISECONDS = '3',
-    TYPE_ALLOCATIONS  = '4',
-    TYPE_ID           = '5',
-    TYPE_PERCENT      = '6'
-};
-
 static int android_log_printBinaryEvent(const unsigned char** pEventData,
-    size_t* pEventDataLen, char** pOutBuf, size_t* pOutBufLen,
-    const char** fmtStr, size_t* fmtLen)
+    size_t* pEventDataLen, char** pOutBuf, size_t* pOutBufLen)
 {
     const unsigned char* eventData = *pEventData;
     size_t eventDataLen = *pEventDataLen;
     char* outBuf = *pOutBuf;
-    char* outBufSave = outBuf;
     size_t outBufLen = *pOutBufLen;
-    size_t outBufLenSave = outBufLen;
     unsigned char type;
     size_t outCount;
     int result = 0;
-    const char* cp;
-    size_t len;
-    int64_t lval;
 
-    if (eventDataLen < 1) return -1;
-
+    if (eventDataLen < 1)
+        return -1;
     type = *eventData++;
     eventDataLen--;
 
-    cp = NULL;
-    len = 0;
-    if (fmtStr && *fmtStr && fmtLen && *fmtLen && **fmtStr) {
-        cp = *fmtStr;
-        len = *fmtLen;
-    }
-    /*
-     * event.logtag format specification:
-     *
-     * Optionally, after the tag names can be put a description for the value(s)
-     * of the tag. Description are in the format
-     *    (<name>|data type[|data unit])
-     * Multiple values are separated by commas.
-     *
-     * The data type is a number from the following values:
-     * 1: int
-     * 2: long
-     * 3: string
-     * 4: list
-     * 5: float
-     *
-     * The data unit is a number taken from the following list:
-     * 1: Number of objects
-     * 2: Number of bytes
-     * 3: Number of milliseconds
-     * 4: Number of allocations
-     * 5: Id
-     * 6: Percent
-     * Default value for data of type int/long is 2 (bytes).
-     */
-    if (!cp || !findChar(&cp, &len, '(')) {
-        len = 0;
-    } else {
-        char* outBufLastSpace = NULL;
-
-        findChar(&cp, &len, INT_MAX);
-        while (len && *cp && (*cp != '|') && (*cp != ')')) {
-            if (outBufLen <= 0) {
-                /* halt output */
-                goto no_room;
-            }
-            outBufLastSpace = isspace(*cp) ? outBuf : NULL;
-            *outBuf = *cp;
-            ++outBuf;
-            ++cp;
-            --outBufLen;
-            --len;
-        }
-        if (outBufLastSpace) {
-            outBufLen += outBuf - outBufLastSpace;
-            outBuf = outBufLastSpace;
-        }
-        if (outBufLen <= 0) {
-            /* halt output */
-            goto no_room;
-        }
-        if (outBufSave != outBuf) {
-            *outBuf = '=';
-            ++outBuf;
-            --outBufLen;
-        }
-
-        if (findChar(&cp, &len, '|') && findChar(&cp, &len, INT_MAX)) {
-            static const unsigned char typeTable[] = {
-                EVENT_TYPE_INT,
-                EVENT_TYPE_LONG,
-                EVENT_TYPE_STRING,
-                EVENT_TYPE_LIST,
-                EVENT_TYPE_FLOAT
-            };
-
-            if ((*cp >= '1') &&
-                (*cp < (char)('1' + (sizeof(typeTable) / sizeof(typeTable[0])))) &&
-                (type != typeTable[(size_t)(*cp - '1')])) len = 0;
-
-            if (len) {
-                ++cp;
-                --len;
-            } else {
-                /* reset the format */
-                outBuf = outBufSave;
-                outBufLen = outBufLenSave;
-            }
-        }
-    }
-    lval = 0;
     switch (type) {
     case EVENT_TYPE_INT:
         /* 32-bit signed int */
         {
-            int32_t ival;
+            int ival;
 
-            if (eventDataLen < 4) return -1;
+            if (eventDataLen < 4)
+                return -1;
             ival = get4LE(eventData);
             eventData += 4;
             eventDataLen -= 4;
 
-            lval = ival;
+            outCount = snprintf(outBuf, outBufLen, "%d", ival);
+            if (outCount < outBufLen) {
+                outBuf += outCount;
+                outBufLen -= outCount;
+            } else {
+                /* halt output */
+                goto no_room;
+            }
         }
-        goto pr_lval;
+        break;
     case EVENT_TYPE_LONG:
         /* 64-bit signed long */
-        if (eventDataLen < 8) return -1;
-        lval = get8LE(eventData);
-        eventData += 8;
-        eventDataLen -= 8;
-    pr_lval:
-        outCount = snprintf(outBuf, outBufLen, "%" PRId64, lval);
-        if (outCount < outBufLen) {
-            outBuf += outCount;
-            outBufLen -= outCount;
-        } else {
-            /* halt output */
-            goto no_room;
+        {
+            uint64_t lval;
+
+            if (eventDataLen < 8)
+                return -1;
+            lval = get8LE(eventData);
+            eventData += 8;
+            eventDataLen -= 8;
+
+            outCount = snprintf(outBuf, outBufLen, "%" PRId64, lval);
+            if (outCount < outBufLen) {
+                outBuf += outCount;
+                outBufLen -= outCount;
+            } else {
+                /* halt output */
+                goto no_room;
+            }
         }
         break;
     case EVENT_TYPE_FLOAT:
@@ -759,7 +636,8 @@ static int android_log_printBinaryEvent(const unsigned char** pEventData,
             uint32_t ival;
             float fval;
 
-            if (eventDataLen < 4) return -1;
+            if (eventDataLen < 4)
+                return -1;
             ival = get4LE(eventData);
             fval = *(float*)&ival;
             eventData += 4;
@@ -780,18 +658,15 @@ static int android_log_printBinaryEvent(const unsigned char** pEventData,
         {
             unsigned int strLen;
 
-            if (eventDataLen < 4) return -1;
+            if (eventDataLen < 4)
+                return -1;
             strLen = get4LE(eventData);
             eventData += 4;
             eventDataLen -= 4;
 
-            if (eventDataLen < strLen) return -1;
+            if (eventDataLen < strLen)
+                return -1;
 
-            if (cp && (strLen == 0)) {
-                /* reset the format if no content */
-                outBuf = outBufSave;
-                outBufLen = outBufLenSave;
-            }
             if (strLen < outBufLen) {
                 memcpy(outBuf, eventData, strLen);
                 outBuf += strLen;
@@ -813,111 +688,46 @@ static int android_log_printBinaryEvent(const unsigned char** pEventData,
             unsigned char count;
             int i;
 
-            if (eventDataLen < 1) return -1;
+            if (eventDataLen < 1)
+                return -1;
 
             count = *eventData++;
             eventDataLen--;
 
-            if (outBufLen <= 0) goto no_room;
-
-            *outBuf++ = '[';
-            outBufLen--;
+            if (outBufLen > 0) {
+                *outBuf++ = '[';
+                outBufLen--;
+            } else {
+                goto no_room;
+            }
 
             for (i = 0; i < count; i++) {
                 result = android_log_printBinaryEvent(&eventData, &eventDataLen,
-                        &outBuf, &outBufLen, fmtStr, fmtLen);
-                if (result != 0) goto bail;
+                        &outBuf, &outBufLen);
+                if (result != 0)
+                    goto bail;
 
-                if (i < (count - 1)) {
-                    if (outBufLen <= 0) goto no_room;
-                    *outBuf++ = ',';
-                    outBufLen--;
+                if (i < count-1) {
+                    if (outBufLen > 0) {
+                        *outBuf++ = ',';
+                        outBufLen--;
+                    } else {
+                        goto no_room;
+                    }
                 }
             }
 
-            if (outBufLen <= 0) goto no_room;
-
-            *outBuf++ = ']';
-            outBufLen--;
+            if (outBufLen > 0) {
+                *outBuf++ = ']';
+                outBufLen--;
+            } else {
+                goto no_room;
+            }
         }
         break;
     default:
         fprintf(stderr, "Unknown binary event type %d\n", type);
         return -1;
-    }
-    if (cp && len) {
-        if (findChar(&cp, &len, '|') && findChar(&cp, &len, INT_MAX)) {
-            switch (*cp) {
-            case TYPE_OBJECTS:
-                outCount = 0;
-                /* outCount = snprintf(outBuf, outBufLen, " objects"); */
-                break;
-            case TYPE_BYTES:
-                if ((lval != 0) && ((lval % 1024) == 0)) {
-                    /* repaint with multiplier */
-                    static const char suffixTable[] = { 'K', 'M', 'G', 'T' };
-                    size_t idx = 0;
-                    outBuf -= outCount;
-                    outBufLen += outCount;
-                    do {
-                        lval /= 1024;
-                        if ((lval % 1024) != 0) break;
-                    } while (++idx < ((sizeof(suffixTable) /
-                                       sizeof(suffixTable[0])) - 1));
-                    outCount = snprintf(outBuf, outBufLen,
-                                        "%" PRId64 "%cB",
-                                        lval, suffixTable[idx]);
-                } else {
-                    outCount = snprintf(outBuf, outBufLen, "B");
-                }
-                break;
-            case TYPE_MILLISECONDS:
-                if (((lval <= -1000) || (1000 <= lval)) &&
-                        (outBufLen || (outBuf[-1] == '0'))) {
-                    /* repaint as (fractional) seconds, possibly saving space */
-                    if (outBufLen) outBuf[0] = outBuf[-1];
-                    outBuf[-1] = outBuf[-2];
-                    outBuf[-2] = outBuf[-3];
-                    outBuf[-3] = '.';
-                    while ((outBufLen == 0) || (*outBuf == '0')) {
-                        --outBuf;
-                        ++outBufLen;
-                    }
-                    if (*outBuf != '.') {
-                       ++outBuf;
-                       --outBufLen;
-                    }
-                    outCount = snprintf(outBuf, outBufLen, "s");
-                } else {
-                    outCount = snprintf(outBuf, outBufLen, "ms");
-                }
-                break;
-            case TYPE_ALLOCATIONS:
-                outCount = 0;
-                /* outCount = snprintf(outBuf, outBufLen, " allocations"); */
-                break;
-            case TYPE_ID:
-                outCount = 0;
-                break;
-            case TYPE_PERCENT:
-                outCount = snprintf(outBuf, outBufLen, "%%");
-                break;
-            default: /* ? */
-                outCount = 0;
-                break;
-            }
-            ++cp;
-            --len;
-            if (outCount < outBufLen) {
-                outBuf += outCount;
-                outBufLen -= outCount;
-            } else if (outCount) {
-                /* halt output */
-                goto no_room;
-            }
-        }
-        if (!findChar(&cp, &len, ')')) len = 0;
-        if (!findChar(&cp, &len, ',')) len = 0;
     }
 
 bail:
@@ -925,10 +735,6 @@ bail:
     *pEventDataLen = eventDataLen;
     *pOutBuf = outBuf;
     *pOutBufLen = outBufLen;
-    if (cp) {
-        *fmtStr = cp;
-        *fmtLen = len;
-    }
     return result;
 
 no_room:
@@ -951,7 +757,7 @@ LIBLOG_ABI_PUBLIC int android_log_processBinaryLogBuffer(
         char *messageBuf, int messageBufLen)
 {
     size_t inCount;
-    uint32_t tagIndex;
+    unsigned int tagIndex;
     const unsigned char* eventData;
 
     entry->tv_sec = buf->sec;
@@ -968,11 +774,6 @@ LIBLOG_ABI_PUBLIC int android_log_processBinaryLogBuffer(
     eventData = (const unsigned char*) buf->msg;
     struct logger_entry_v2 *buf2 = (struct logger_entry_v2 *)buf;
     if (buf2->hdr_size) {
-        if ((buf2->hdr_size < sizeof(((struct log_msg *)NULL)->entry_v1)) ||
-                (buf2->hdr_size > sizeof(((struct log_msg *)NULL)->entry))) {
-            fprintf(stderr, "+++ LOG: entry illegal hdr_size\n");
-            return -1;
-        }
         eventData = ((unsigned char *)buf2) + buf2->hdr_size;
         if ((buf2->hdr_size >= sizeof(struct logger_entry_v3)) &&
                 (((struct logger_entry_v3 *)buf)->lid == LOG_ID_SECURITY)) {
@@ -983,14 +784,14 @@ LIBLOG_ABI_PUBLIC int android_log_processBinaryLogBuffer(
         }
     }
     inCount = buf->len;
-    if (inCount < 4) return -1;
+    if (inCount < 4)
+        return -1;
     tagIndex = get4LE(eventData);
     eventData += 4;
     inCount -= 4;
 
-    entry->tagLen = 0;
     if (map != NULL) {
-        entry->tag = android_lookupEventTag_len(map, &entry->tagLen, tagIndex);
+        entry->tag = android_lookupEventTag(map, tagIndex);
     } else {
         entry->tag = NULL;
     }
@@ -1001,61 +802,36 @@ LIBLOG_ABI_PUBLIC int android_log_processBinaryLogBuffer(
      * shift the buffer pointers down.
      */
     if (entry->tag == NULL) {
-        size_t tagLen;
+        int tagLen;
 
-        tagLen = snprintf(messageBuf, messageBufLen, "[%" PRIu32 "]", tagIndex);
-        if (tagLen >= (size_t)messageBufLen) {
-            tagLen = messageBufLen - 1;
-        }
+        tagLen = snprintf(messageBuf, messageBufLen, "[%d]", tagIndex);
         entry->tag = messageBuf;
-        entry->tagLen = tagLen;
-        messageBuf += tagLen + 1;
-        messageBufLen -= tagLen + 1;
+        messageBuf += tagLen+1;
+        messageBufLen -= tagLen+1;
     }
 
     /*
      * Format the event log data into the buffer.
      */
-    const char* fmtStr = NULL;
-    size_t fmtLen = 0;
-    if (descriptive_output && map) {
-        fmtStr = android_lookupEventFormat_len(map, &fmtLen, tagIndex);
-    }
-
     char* outBuf = messageBuf;
-    size_t outRemaining = messageBufLen - 1; /* leave one for nul byte */
-    int result = 0;
-
-    if ((inCount > 0) || fmtLen) {
-        result = android_log_printBinaryEvent(&eventData, &inCount, &outBuf,
-                                              &outRemaining, &fmtStr, &fmtLen);
-    }
-    if ((result == 1) && fmtStr) {
-        /* We overflowed :-(, let's repaint the line w/o format dressings */
-        eventData = (const unsigned char*)buf->msg;
-        if (buf2->hdr_size) {
-            eventData = ((unsigned char *)buf2) + buf2->hdr_size;
-        }
-        eventData += 4;
-        outBuf = messageBuf;
-        outRemaining = messageBufLen - 1;
-        result = android_log_printBinaryEvent(&eventData, &inCount, &outBuf,
-                                              &outRemaining, NULL, NULL);
-    }
+    size_t outRemaining = messageBufLen-1;      /* leave one for nul byte */
+    int result;
+    result = android_log_printBinaryEvent(&eventData, &inCount, &outBuf,
+                &outRemaining);
     if (result < 0) {
         fprintf(stderr, "Binary log entry conversion failed\n");
-    }
-    if (result) {
-        if (!outRemaining) {
-            /* make space to leave an indicator */
-            --outBuf;
-            ++outRemaining;
+        return -1;
+    } else if (result == 1) {
+        if (outBuf > messageBuf) {
+            /* leave an indicator */
+            *(outBuf-1) = '!';
+        } else {
+            /* no room to output anything at all */
+            *outBuf++ = '!';
+            outRemaining--;
         }
-        *outBuf++ = (result < 0) ? '!' : '^'; /* Error or Truncation? */
-        outRemaining--;
-        /* pretend we ate all the data to prevent log stutter */
+        /* pretend we ate all the data */
         inCount = 0;
-        if (result > 0) result = 0;
     }
 
     /* eat the silly terminating '\n' */
@@ -1079,7 +855,7 @@ LIBLOG_ABI_PUBLIC int android_log_processBinaryLogBuffer(
 
     entry->message = messageBuf;
 
-    return result;
+    return 0;
 }
 
 /*
@@ -1576,17 +1352,17 @@ LIBLOG_ABI_PUBLIC char *android_log_formatLogLine (
     uid[0] = '\0';
     if (p_format->uid_output) {
         if (entry->uid >= 0) {
+            const struct android_id_info *info = android_ids;
+            size_t i;
 
-            /*
-             * This code is Android specific, bionic guarantees that
-             * calls to non-reentrant getpwuid() are thread safe.
-             */
-#ifndef __BIONIC__
-#warning "This code assumes that getpwuid is thread safe, only true with Bionic!"
-#endif
-            struct passwd* pwd = getpwuid(entry->uid);
-            if (pwd && (strlen(pwd->pw_name) <= 5)) {
-                 snprintf(uid, sizeof(uid), "%5s:", pwd->pw_name);
+            for (i = 0; i < android_id_count; ++i) {
+                if (info->aid == (unsigned int)entry->uid) {
+                    break;
+                }
+                ++info;
+            }
+            if ((i < android_id_count) && (strlen(info->name) <= 5)) {
+                 snprintf(uid, sizeof(uid), "%5s:", info->name);
             } else {
                  // Not worth parsing package list, names all longer than 5
                  snprintf(uid, sizeof(uid), "%5d:", entry->uid);
@@ -1599,13 +1375,13 @@ LIBLOG_ABI_PUBLIC char *android_log_formatLogLine (
     switch (p_format->format) {
         case FORMAT_TAG:
             len = snprintf(prefixBuf + prefixLen, sizeof(prefixBuf) - prefixLen,
-                "%c/%-8.*s: ", priChar, (int)entry->tagLen, entry->tag);
+                "%c/%-8s: ", priChar, entry->tag);
             strcpy(suffixBuf + suffixLen, "\n");
             ++suffixLen;
             break;
         case FORMAT_PROCESS:
             len = snprintf(suffixBuf + suffixLen, sizeof(suffixBuf) - suffixLen,
-                "  (%.*s)\n", (int)entry->tagLen, entry->tag);
+                "  (%s)\n", entry->tag);
             suffixLen += MIN(len, sizeof(suffixBuf) - suffixLen);
             len = snprintf(prefixBuf + prefixLen, sizeof(prefixBuf) - prefixLen,
                 "%c(%s%5d) ", priChar, uid, entry->pid);
@@ -1624,8 +1400,8 @@ LIBLOG_ABI_PUBLIC char *android_log_formatLogLine (
             break;
         case FORMAT_TIME:
             len = snprintf(prefixBuf + prefixLen, sizeof(prefixBuf) - prefixLen,
-                "%s %c/%-8.*s(%s%5d): ", timeBuf, priChar,
-                (int)entry->tagLen, entry->tag, uid, entry->pid);
+                "%s %c/%-8s(%s%5d): ", timeBuf, priChar, entry->tag,
+                uid, entry->pid);
             strcpy(suffixBuf + suffixLen, "\n");
             ++suffixLen;
             break;
@@ -1635,16 +1411,15 @@ LIBLOG_ABI_PUBLIC char *android_log_formatLogLine (
                 *ret = ' ';
             }
             len = snprintf(prefixBuf + prefixLen, sizeof(prefixBuf) - prefixLen,
-                "%s %s%5d %5d %c %-8.*s: ", timeBuf, uid, entry->pid,
-                entry->tid, priChar, (int)entry->tagLen, entry->tag);
+                "%s %s%5d %5d %c %-8s: ", timeBuf,
+                uid, entry->pid, entry->tid, priChar, entry->tag);
             strcpy(suffixBuf + suffixLen, "\n");
             ++suffixLen;
             break;
         case FORMAT_LONG:
             len = snprintf(prefixBuf + prefixLen, sizeof(prefixBuf) - prefixLen,
-                "[ %s %s%5d:%5d %c/%-8.*s ]\n",
-                timeBuf, uid, entry->pid, entry->tid, priChar,
-                (int)entry->tagLen, entry->tag);
+                "[ %s %s%5d:%5d %c/%-8s ]\n",
+                timeBuf, uid, entry->pid, entry->tid, priChar, entry->tag);
             strcpy(suffixBuf + suffixLen, "\n\n");
             suffixLen += 2;
             prefixSuffixIsHeaderFooter = 1;
@@ -1652,8 +1427,7 @@ LIBLOG_ABI_PUBLIC char *android_log_formatLogLine (
         case FORMAT_BRIEF:
         default:
             len = snprintf(prefixBuf + prefixLen, sizeof(prefixBuf) - prefixLen,
-                "%c/%-8.*s(%s%5d): ", priChar, (int)entry->tagLen, entry->tag,
-                uid, entry->pid);
+                "%c/%-8s(%s%5d): ", priChar, entry->tag, uid, entry->pid);
             strcpy(suffixBuf + suffixLen, "\n");
             ++suffixLen;
             break;
@@ -1791,7 +1565,8 @@ LIBLOG_ABI_PUBLIC int android_log_printLogLine(
     outBuffer = android_log_formatLogLine(p_format, defaultBuffer,
             sizeof(defaultBuffer), entry, &totalLen);
 
-    if (!outBuffer) return -1;
+    if (!outBuffer)
+        return -1;
 
     do {
         ret = write(fd, outBuffer, totalLen);

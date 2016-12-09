@@ -15,17 +15,14 @@
  */
 
 #include <assert.h>
-#include <ctype.h>
 #include <errno.h>
 #include <fcntl.h>
-#include <inttypes.h>
-#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
 
-#include <android/log.h>
 #include <log/event_tag_map.h>
+#include <log/log.h>
 
 #include "log_portability.h"
 
@@ -35,11 +32,8 @@
  * Single entry.
  */
 typedef struct EventTag {
-    uint32_t tagIndex;
-    char*    tagStr;
-    size_t   tagLen;
-    char*    fmtStr;
-    size_t   fmtLen;
+    unsigned int    tagIndex;
+    const char*     tagStr;
 } EventTag;
 
 /*
@@ -62,6 +56,7 @@ static int parseMapLines(EventTagMap* map);
 static int scanTagLine(char** pData, EventTag* tag, int lineNum);
 static int sortTags(EventTagMap* map);
 
+
 /*
  * Open the map file and allocate a structure to manage it.
  *
@@ -72,58 +67,47 @@ LIBLOG_ABI_PUBLIC EventTagMap* android_openEventTagMap(const char* fileName)
 {
     EventTagMap* newTagMap;
     off_t end;
-    int save_errno;
-    const char* tagfile = fileName ? fileName : EVENT_TAG_MAP_FILE;
+    int fd = -1;
 
-    int fd = open(tagfile, O_RDONLY | O_CLOEXEC);
+    newTagMap = calloc(1, sizeof(EventTagMap));
+    if (newTagMap == NULL)
+        return NULL;
+
+    fd = open(fileName, O_RDONLY | O_CLOEXEC);
     if (fd < 0) {
-        save_errno = errno;
         fprintf(stderr, "%s: unable to open map '%s': %s\n",
-                OUT_TAG, tagfile, strerror(save_errno));
-        goto fail_errno;
+            OUT_TAG, fileName, strerror(errno));
+        goto fail;
     }
 
     end = lseek(fd, 0L, SEEK_END);
-    save_errno = errno;
     (void) lseek(fd, 0L, SEEK_SET);
     if (end < 0) {
-        fprintf(stderr, "%s: unable to seek map '%s' %s\n",
-                OUT_TAG, tagfile, strerror(save_errno));
-        goto fail_close;
+        fprintf(stderr, "%s: unable to seek map '%s'\n", OUT_TAG, fileName);
+        goto fail;
     }
 
-    newTagMap = (EventTagMap*)calloc(1, sizeof(EventTagMap));
-    if (newTagMap == NULL) {
-        save_errno = errno;
-        goto fail_close;
-    }
-
-    newTagMap->mapAddr = mmap(NULL, end, PROT_READ | PROT_WRITE, MAP_PRIVATE, fd, 0);
-    save_errno = errno;
-    close(fd);
-    fd = -1;
-    if ((newTagMap->mapAddr == MAP_FAILED) || (newTagMap->mapAddr == NULL)) {
+    newTagMap->mapAddr = mmap(NULL, end, PROT_READ | PROT_WRITE, MAP_PRIVATE,
+                                fd, 0);
+    if (newTagMap->mapAddr == MAP_FAILED) {
         fprintf(stderr, "%s: mmap(%s) failed: %s\n",
-                OUT_TAG, tagfile, strerror(save_errno));
-        goto fail_free;
+            OUT_TAG, fileName, strerror(errno));
+        goto fail;
     }
-
     newTagMap->mapLen = end;
 
-    if (processFile(newTagMap) != 0) goto fail_unmap;
+    if (processFile(newTagMap) != 0)
+        goto fail;
+
+    if (fd >= 0)
+      close(fd);
 
     return newTagMap;
 
-fail_unmap:
-    munmap(newTagMap->mapAddr, newTagMap->mapLen);
-    save_errno = EINVAL;
-fail_free:
-    free(newTagMap);
-fail_close:
-    close(fd);
-fail_errno:
-    errno = save_errno;
 fail:
+    android_closeEventTagMap(newTagMap);
+    if (fd >= 0)
+        close(fd);
     return NULL;
 }
 
@@ -132,10 +116,10 @@ fail:
  */
 LIBLOG_ABI_PUBLIC void android_closeEventTagMap(EventTagMap* map)
 {
-    if (map == NULL) return;
+    if (map == NULL)
+        return;
 
     munmap(map->mapAddr, map->mapLen);
-    free(map->tagArray);
     free(map);
 }
 
@@ -144,17 +128,19 @@ LIBLOG_ABI_PUBLIC void android_closeEventTagMap(EventTagMap* map)
  *
  * The entries are sorted by tag number, so we can do a binary search.
  */
-LIBLOG_ABI_PUBLIC const char* android_lookupEventTag_len(const EventTagMap* map,
-                                                         size_t *len,
-                                                         unsigned int tag)
+LIBLOG_ABI_PUBLIC const char* android_lookupEventTag(const EventTagMap* map,
+                                                     int tag)
 {
-    int lo = 0;
-    int hi = map->numTags - 1;
+    int hi, lo, mid;
+
+    lo = 0;
+    hi = map->numTags-1;
 
     while (lo <= hi) {
-        int mid = (lo + hi) / 2;
-        int cmp = map->tagArray[mid].tagIndex - tag;
+        int cmp;
 
+        mid = (lo+hi)/2;
+        cmp = map->tagArray[mid].tagIndex - tag;
         if (cmp < 0) {
             /* tag is bigger */
             lo = mid + 1;
@@ -163,68 +149,42 @@ LIBLOG_ABI_PUBLIC const char* android_lookupEventTag_len(const EventTagMap* map,
             hi = mid - 1;
         } else {
             /* found */
-            if (len) *len = map->tagArray[mid].tagLen;
-            /*
-             * b/31456426 to check if gTest can detect copy-on-write issue
-             * add the following line to break us:
-             *     map->tagArray[mid].tagStr[map->tagArray[mid].tagLen] = '\0';
-             * or explicitly use deprecated android_lookupEventTag().
-             */
             return map->tagArray[mid].tagStr;
         }
     }
 
-    errno = ENOENT;
-    if (len) *len = 0;
     return NULL;
+}
+
+
+
+/*
+ * Determine whether "c" is a whitespace char.
+ */
+static inline int isCharWhitespace(char c)
+{
+    return (c == ' ' || c == '\n' || c == '\r' || c == '\t');
 }
 
 /*
- * Look up an entry in the map.
- *
- * The entries are sorted by tag number, so we can do a binary search.
+ * Determine whether "c" is a valid tag char.
  */
-LIBLOG_ABI_PUBLIC const char* android_lookupEventFormat_len(
-    const EventTagMap* map, size_t *len, unsigned int tag)
+static inline int isCharValidTag(char c)
 {
-    int lo = 0;
-    int hi = map->numTags - 1;
-
-    while (lo <= hi) {
-        int mid = (lo + hi) / 2;
-        int cmp = map->tagArray[mid].tagIndex - tag;
-
-        if (cmp < 0) {
-            /* tag is bigger */
-            lo = mid + 1;
-        } else if (cmp > 0) {
-            /* tag is smaller */
-            hi = mid - 1;
-        } else {
-            /* found */
-            if (len) *len = map->tagArray[mid].fmtLen;
-            return map->tagArray[mid].fmtStr;
-        }
-    }
-
-    errno = ENOENT;
-    if (len) *len = 0;
-    return NULL;
+    return ((c >= 'A' && c <= 'Z') ||
+            (c >= 'a' && c <= 'z') ||
+            (c >= '0' && c <= '9') ||
+            (c == '_'));
 }
 
-LIBLOG_ABI_PUBLIC const char* android_lookupEventTag(const EventTagMap* map,
-                                                     unsigned int tag)
+/*
+ * Determine whether "c" is a valid decimal digit.
+ */
+static inline int isCharDigit(char c)
 {
-    size_t len;
-    const char* tagStr = android_lookupEventTag_len(map, &len, tag);
-    char* cp;
-
-    if (!tagStr) return tagStr;
-    cp = (char*)tagStr;
-    cp += len;
-    if (*cp) *cp = '\0'; /* Trigger copy on write :-( */
-    return tagStr;
+    return (c >= '0' && c <= '9');
 }
+
 
 /*
  * Crunch through the file, parsing the contents and creating a tag index.
@@ -233,20 +193,25 @@ static int processFile(EventTagMap* map)
 {
     /* get a tag count */
     map->numTags = countMapLines(map);
-    if (map->numTags < 0) {
-        errno = ENOENT;
+    if (map->numTags < 0)
+        return -1;
+
+    //printf("+++ found %d tags\n", map->numTags);
+
+    /* allocate storage for the tag index array */
+    map->tagArray = calloc(1, sizeof(EventTag) * map->numTags);
+    if (map->tagArray == NULL)
+        return -1;
+
+    /* parse the file, null-terminating tag strings */
+    if (parseMapLines(map) != 0) {
+        fprintf(stderr, "%s: file parse failed\n", OUT_TAG);
         return -1;
     }
 
-    /* allocate storage for the tag index array */
-    map->tagArray = (EventTag*)calloc(1, sizeof(EventTag) * map->numTags);
-    if (map->tagArray == NULL) return -1;
-
-    /* parse the file, null-terminating tag strings */
-    if (parseMapLines(map) != 0) return -1;
-
     /* sort the tags and check for duplicates */
-    if (sortTags(map) != 0) return -1;
+    if (sortTags(map) != 0)
+        return -1;
 
     return 0;
 }
@@ -263,20 +228,24 @@ static int processFile(EventTagMap* map)
  */
 static int countMapLines(const EventTagMap* map)
 {
-    const char* cp = (const char*) map->mapAddr;
-    const char* endp = cp + map->mapLen;
-    int numTags = 0;
-    int unknown = 1;
+    int numTags, unknown;
+    const char* cp;
+    const char* endp;
 
+    cp = (const char*) map->mapAddr;
+    endp = cp + map->mapLen;
+
+    numTags = 0;
+    unknown = 1;
     while (cp < endp) {
         if (*cp == '\n') {
             unknown = 1;
         } else if (unknown) {
-            if (isdigit(*cp)) {
+            if (isCharDigit(*cp)) {
                 /* looks like a tag to me */
                 numTags++;
                 unknown = 0;
-            } else if (isspace(*cp)) {
+            } else if (isCharWhitespace(*cp)) {
                 /* might be leading whitespace before tag num, keep going */
             } else {
                 /* assume comment; second pass can complain in detail */
@@ -297,13 +266,15 @@ static int countMapLines(const EventTagMap* map)
 static int parseMapLines(EventTagMap* map)
 {
     int tagNum, lineStart, lineNum;
-    char* cp = (char*) map->mapAddr;
-    char* endp = cp + map->mapLen;
+    char* cp;
+    char* endp;
+
+    cp = (char*) map->mapAddr;
+    endp = cp + map->mapLen;
 
     /* insist on EOL at EOF; simplifies parsing and null-termination */
-    if (*(endp - 1) != '\n') {
+    if (*(endp-1) != '\n') {
         fprintf(stderr, "%s: map file missing EOL on last line\n", OUT_TAG);
-        errno = EINVAL;
         return -1;
     }
 
@@ -311,6 +282,7 @@ static int parseMapLines(EventTagMap* map)
     lineStart = 1;
     lineNum = 1;
     while (cp < endp) {
+        //printf("{%02x}", *cp); fflush(stdout);
         if (*cp == '\n') {
             lineStart = 1;
             lineNum++;
@@ -318,27 +290,24 @@ static int parseMapLines(EventTagMap* map)
             if (*cp == '#') {
                 /* comment; just scan to end */
                 lineStart = 0;
-            } else if (isdigit(*cp)) {
+            } else if (isCharDigit(*cp)) {
                 /* looks like a tag; scan it out */
                 if (tagNum >= map->numTags) {
                     fprintf(stderr,
                         "%s: more tags than expected (%d)\n", OUT_TAG, tagNum);
-                    errno = EMFILE;
                     return -1;
                 }
-                if (scanTagLine(&cp, &map->tagArray[tagNum], lineNum) != 0) {
+                if (scanTagLine(&cp, &map->tagArray[tagNum], lineNum) != 0)
                     return -1;
-                }
                 tagNum++;
                 lineNum++;      // we eat the '\n'
                 /* leave lineStart==1 */
-            } else if (isspace(*cp)) {
+            } else if (isCharWhitespace(*cp)) {
                 /* looks like leading whitespace; keep scanning */
             } else {
                 fprintf(stderr,
                     "%s: unexpected chars (0x%02x) in tag number on line %d\n",
                     OUT_TAG, *cp, lineNum);
-                errno = EINVAL;
                 return -1;
             }
         } else {
@@ -350,7 +319,6 @@ static int parseMapLines(EventTagMap* map)
     if (tagNum != map->numTags) {
         fprintf(stderr, "%s: parsed %d tags, expected %d\n",
             OUT_TAG, tagNum, map->numTags);
-        errno = EINVAL;
         return -1;
     }
 
@@ -368,55 +336,58 @@ static int parseMapLines(EventTagMap* map)
  */
 static int scanTagLine(char** pData, EventTag* tag, int lineNum)
 {
-    char* cp;
+    char* cp = *pData;
+    char* startp;
+    char* endp;
+    unsigned long val;
 
-    unsigned long val = strtoul(*pData, &cp, 10);
-    if (cp == *pData) {
-        fprintf(stderr, "%s: malformed tag number on line %d\n", OUT_TAG, lineNum);
-        errno = EINVAL;
-        return -1;
-    }
+    startp = cp;
+    while (isCharDigit(*++cp))
+        ;
+    *cp = '\0';
+
+    val = strtoul(startp, &endp, 10);
+    assert(endp == cp);
+    if (endp != cp)
+        fprintf(stderr, "ARRRRGH\n");
 
     tag->tagIndex = val;
-    if (tag->tagIndex != val) {
-        fprintf(stderr, "%s: tag number too large on line %d\n", OUT_TAG, lineNum);
-        errno = ERANGE;
-        return -1;
-    }
 
-    while ((*++cp != '\n') && isspace(*cp)) {
-    }
+    while (*++cp != '\n' && isCharWhitespace(*cp))
+        ;
 
     if (*cp == '\n') {
-        fprintf(stderr, "%s: missing tag string on line %d\n", OUT_TAG, lineNum);
-        errno = EINVAL;
+        fprintf(stderr,
+            "%s: missing tag string on line %d\n", OUT_TAG, lineNum);
         return -1;
     }
 
     tag->tagStr = cp;
 
-    /* Determine whether "c" is a valid tag char. */
-    while (isalnum(*++cp) || (*cp == '_')) {
-    }
-    tag->tagLen = cp - tag->tagStr;
+    while (isCharValidTag(*++cp))
+        ;
 
-    if (!isspace(*cp)) {
-        fprintf(stderr, "%s: invalid tag chars on line %d\n", OUT_TAG, lineNum);
-        errno = EINVAL;
+    if (*cp == '\n') {
+        /* null terminate and return */
+        *cp = '\0';
+    } else if (isCharWhitespace(*cp)) {
+        /* CRLF or trailin spaces; zap this char, then scan for the '\n' */
+        *cp = '\0';
+
+        /* just ignore the rest of the line till \n
+        TODO: read the tag description that follows the tag name
+        */
+        while (*++cp != '\n') {
+        }
+    } else {
+        fprintf(stderr,
+            "%s: invalid tag chars on line %d\n", OUT_TAG, lineNum);
         return -1;
     }
 
-    while (isspace(*cp) && (*cp != '\n')) ++cp;
-    if (*cp != '#') {
-        tag->fmtStr = cp;
-        while ((*cp != '\n') && (*cp != '#')) ++cp;
-        while ((cp > tag->fmtStr) && isspace(*(cp - 1))) --cp;
-        tag->fmtLen = cp - tag->fmtStr;
-    }
-
-    while (*cp != '\n') ++cp;
     *pData = cp;
 
+    //printf("+++ Line %d: got %d '%s'\n", lineNum, tag->tagIndex, tag->tagStr);
     return 0;
 }
 
@@ -444,17 +415,11 @@ static int sortTags(EventTagMap* map)
     qsort(map->tagArray, map->numTags, sizeof(EventTag), compareEventTags);
 
     for (i = 1; i < map->numTags; i++) {
-        if (map->tagArray[i].tagIndex == map->tagArray[i - 1].tagIndex) {
-            fprintf(stderr,
-                "%s: duplicate tag entries (%" PRIu32 ":%.*s:%.*s and %" PRIu32 ":%.*s:%.*s)\n",
+        if (map->tagArray[i].tagIndex == map->tagArray[i-1].tagIndex) {
+            fprintf(stderr, "%s: duplicate tag entries (%d:%s and %d:%s)\n",
                 OUT_TAG,
-                map->tagArray[i].tagIndex,
-                (int)map->tagArray[i].tagLen, map->tagArray[i].tagStr,
-                (int)map->tagArray[i].fmtLen, map->tagArray[i].fmtStr,
-                map->tagArray[i - 1].tagIndex,
-                (int)map->tagArray[i - 1].tagLen, map->tagArray[i - 1].fmtStr,
-                (int)map->tagArray[i - 1].fmtLen, map->tagArray[i - 1].fmtStr);
-            errno = EMLINK;
+                map->tagArray[i].tagIndex, map->tagArray[i].tagStr,
+                map->tagArray[i-1].tagIndex, map->tagArray[i-1].tagStr);
             return -1;
         }
     }

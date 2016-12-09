@@ -144,15 +144,14 @@ static int pmsgRead(struct android_log_logger_list *logger_list,
     struct __attribute__((__packed__)) {
         android_pmsg_log_header_t p;
         android_log_header_t l;
-        uint8_t prio;
     } buf;
     static uint8_t preread_count;
     bool is_system;
 
     memset(log_msg, 0, sizeof(*log_msg));
 
-    if (atomic_load(&transp->context.fd) <= 0) {
-        int i, fd = open("/sys/fs/pstore/pmsg-ramoops-0", O_RDONLY | O_CLOEXEC);
+    if (transp->context.fd <= 0) {
+        int fd = open("/sys/fs/pstore/pmsg-ramoops-0", O_RDONLY | O_CLOEXEC);
 
         if (fd < 0) {
             return -errno;
@@ -164,22 +163,13 @@ static int pmsgRead(struct android_log_logger_list *logger_list,
                 return -errno;
             }
         }
-        i = atomic_exchange(&transp->context.fd, fd);
-        if ((i > 0) && (i != fd)) {
-            close(i);
-        }
+        transp->context.fd = fd;
         preread_count = 0;
     }
 
     while(1) {
-        int fd;
-
         if (preread_count < sizeof(buf)) {
-            fd = atomic_load(&transp->context.fd);
-            if (fd <= 0) {
-                return -EBADF;
-            }
-            ret = TEMP_FAILURE_RETRY(read(fd,
+            ret = TEMP_FAILURE_RETRY(read(transp->context.fd,
                                           &buf.p.magic + preread_count,
                                           sizeof(buf) - preread_count));
             if (ret < 0) {
@@ -190,16 +180,11 @@ static int pmsgRead(struct android_log_logger_list *logger_list,
         if (preread_count != sizeof(buf)) {
             return preread_count ? -EIO : -EAGAIN;
         }
-        if ((buf.p.magic != LOGGER_MAGIC) ||
-                (buf.p.len <= sizeof(buf)) ||
-                (buf.p.len > (sizeof(buf) + LOGGER_ENTRY_MAX_PAYLOAD)) ||
-                (buf.l.id >= LOG_ID_MAX) ||
-                (buf.l.realtime.tv_nsec >= NS_PER_SEC) ||
-                ((buf.l.id != LOG_ID_EVENTS) &&
-                    (buf.l.id != LOG_ID_SECURITY) &&
-                    ((buf.prio == ANDROID_LOG_UNKNOWN) ||
-                        (buf.prio == ANDROID_LOG_DEFAULT) ||
-                        (buf.prio >= ANDROID_LOG_SILENT)))) {
+        if ((buf.p.magic != LOGGER_MAGIC)
+         || (buf.p.len <= sizeof(buf))
+         || (buf.p.len > (sizeof(buf) + LOGGER_ENTRY_MAX_PAYLOAD))
+         || (buf.l.id >= LOG_ID_MAX)
+         || (buf.l.realtime.tv_nsec >= NS_PER_SEC)) {
             do {
                 memmove(&buf.p.magic, &buf.p.magic + 1, --preread_count);
             } while (preread_count && (buf.p.magic != LOGGER_MAGIC));
@@ -217,17 +202,11 @@ static int pmsgRead(struct android_log_logger_list *logger_list,
             uid = get_best_effective_uid();
             is_system = uid_has_log_permission(uid);
             if (is_system || (uid == buf.p.uid)) {
-                char *msg = is_system ?
-                    log_msg->entry_v4.msg :
-                    log_msg->entry_v3.msg;
-                *msg = buf.prio;
-                fd = atomic_load(&transp->context.fd);
-                if (fd <= 0) {
-                    return -EBADF;
-                }
-                ret = TEMP_FAILURE_RETRY(read(fd,
-                                              msg + sizeof(buf.prio),
-                                              buf.p.len - sizeof(buf)));
+                ret = TEMP_FAILURE_RETRY(read(transp->context.fd,
+                                          is_system ?
+                                              log_msg->entry_v4.msg :
+                                              log_msg->entry_v3.msg,
+                                          buf.p.len - sizeof(buf)));
                 if (ret < 0) {
                     return -errno;
                 }
@@ -235,7 +214,7 @@ static int pmsgRead(struct android_log_logger_list *logger_list,
                     return -EIO;
                 }
 
-                log_msg->entry_v4.len = buf.p.len - sizeof(buf) + sizeof(buf.prio);
+                log_msg->entry_v4.len = buf.p.len - sizeof(buf);
                 log_msg->entry_v4.hdr_size = is_system ?
                     sizeof(log_msg->entry_v4) :
                     sizeof(log_msg->entry_v3);
@@ -248,23 +227,16 @@ static int pmsgRead(struct android_log_logger_list *logger_list,
                     log_msg->entry_v4.uid = buf.p.uid;
                 }
 
-                return ret + sizeof(buf.prio) + log_msg->entry_v4.hdr_size;
+                return ret + log_msg->entry_v4.hdr_size;
             }
         }
 
-        fd = atomic_load(&transp->context.fd);
-        if (fd <= 0) {
-            return -EBADF;
-        }
-        current = TEMP_FAILURE_RETRY(lseek(fd, (off_t)0, SEEK_CUR));
+        current = TEMP_FAILURE_RETRY(lseek(transp->context.fd,
+                                           (off_t)0, SEEK_CUR));
         if (current < 0) {
             return -errno;
         }
-        fd = atomic_load(&transp->context.fd);
-        if (fd <= 0) {
-            return -EBADF;
-        }
-        next = TEMP_FAILURE_RETRY(lseek(fd,
+        next = TEMP_FAILURE_RETRY(lseek(transp->context.fd,
                                         (off_t)(buf.p.len - sizeof(buf)),
                                         SEEK_CUR));
         if (next < 0) {
@@ -278,10 +250,10 @@ static int pmsgRead(struct android_log_logger_list *logger_list,
 
 static void pmsgClose(struct android_log_logger_list *logger_list __unused,
                       struct android_log_transport_context *transp) {
-    int fd = atomic_exchange(&transp->context.fd, 0);
-    if (fd > 0) {
-        close (fd);
+    if (transp->context.fd > 0) {
+        close (transp->context.fd);
     }
+    transp->context.fd = 0;
 }
 
 LIBLOG_ABI_PRIVATE ssize_t __android_log_pmsg_file_read(
@@ -363,10 +335,6 @@ LIBLOG_ABI_PRIVATE ssize_t __android_log_pmsg_file_read(
         char *msg = (char *)&transp.logMsg + hdr_size;
         char *split = NULL;
 
-        if ((hdr_size < sizeof(transp.logMsg.entry_v1)) ||
-                (hdr_size > sizeof(transp.logMsg.entry))) {
-            continue;
-        }
         /* Check for invalid sequence number */
         if ((transp.logMsg.entry.nsec % ANDROID_LOG_PMSG_FILE_SEQUENCE) ||
                 ((transp.logMsg.entry.nsec / ANDROID_LOG_PMSG_FILE_SEQUENCE) >=
